@@ -201,15 +201,41 @@ export default function SimulatorDashboard() {
         </div>
       </div>
 
-      {/* Control Panel */}
-      <ControlPanel
-        inputs={inputs}
-        onInputChange={handleInputChange}
-        disabled={isRunning}
-      />
+      {/* Control Panel and Engine Gauges Side by Side */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* Control Panel */}
+        <ControlPanel
+          inputs={inputs}
+          onInputChange={handleInputChange}
+          disabled={isRunning}
+        />
 
-      {/* Engine Gauges */}
-      <EngineGauges telemetry={telemetry} />
+        {/* Engine Gauges */}
+        <EngineGauges telemetry={telemetry} />
+      </div>
+
+      {/* Backend Integration Status */}
+      <div className="glass-panel rounded-lg p-4">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center space-x-3">
+            <div className="flex items-center space-x-2">
+              <div className="w-2 h-2 bg-red-500 rounded-full"></div>
+              <span className="text-red-400 font-medium">
+                Sending data to backend
+              </span>
+              <span className="text-gray-500 text-sm">(Yet to be integrated)</span>
+            </div>
+          </div>
+
+          <a
+            href="/health-monitoring"
+            className="flex items-center space-x-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-medium transition-colors"
+          >
+            <AlertCircle size={16} />
+            <span>Monitor Engine Health</span>
+          </a>
+        </div>
+      </div>
 
       {/* Telemetry Charts */}
       <TelemetryCharts
