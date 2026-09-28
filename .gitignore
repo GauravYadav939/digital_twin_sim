@@ -1,0 +1,16 @@
+# Frontend dependencies
+frontend/node_modules/
+
+# Build output
+frontend/dist/
+frontend/build/
+
+# Environment files
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
