@@ -1,0 +1,279 @@
+# UAV Piston Engine Simulator — Mathematical Specification v0.3 (Healthy Engine, Final Pre-Implementation Review)
+
+**Supersedes v0.2.** Scope unchanged: generic 4-cylinder, 4-stroke, naturally aspirated, spark-ignition aircraft piston engine. Reduced-order/lumped-parameter model only. No code in this document.
+
+I read the FOCA report (`foca_2007a.pdf`, *Aircraft Piston Engine Emissions — Summary Report*, Swiss FOCA, June 2007, 200 pages) you attached — apologies for saying earlier I couldn't access it; that was about a prior conversation turn, not this one. It's now used throughout §5 (Level 3) and cited specifically, never copied into the generic engine's CONFIG values, per your instruction.
+
+---
+
+## 0. Summary of Changes from v0.2
+
+| # | Issue raised | Fix in v0.3 |
+|---|---|---|
+| 1 | §9.2's "energy residual" is algebraically guaranteed zero — mislabeled as a physical test | Renamed **"Energy Bookkeeping / Implementation-Integrity Test"** (Level 1); new separate **"Thermal-Source Plausibility Test"** added (§6.2), which actually exercises judgment about the split |
+| 2 | `T_ind = P_ind,real/ω` singular at ω=0 | New §4.6a: single unified numerical floor `ω_floor`, explicitly separated from (nonexistent) starter-motor physics |
+| 3 | No negative-ω protection | New §4.6b: post-step clamp to `ω_floor`, explicitly labeled numerical state-handling, not a stall/fault model |
+| 4 | `k_split_exhaust`/`k_cyl_split` not checked for plausibility | §6.2 computes the resulting % split explicitly; **the default split turned out implausible (60% exhaust vs. 11% CHT+oil) and is corrected by adding a missing parameter (`k_reject_to_exhaust`)** — shown transparently, not silently patched |
+| 5 | FOCA report now supplied | Read and integrated as Level 3 benchmark only (§5.3); stoichiometric AFR, λ values, power-mode %, and real flight-test ranges are cited; **none are copied into the generic engine's parameter table** |
+| 6 | No tiered validation structure | New §6: Level 1 (math/numerical) → Level 2 (directional/behavioral) → Level 3 (representative real-engine comparison, explicitly bounded) |
+| 7 | No model-validity/confidence table | New §7 |
+
+---
+
+## 1–3. State Variables, Inputs, Outputs — unchanged from v0.2 §1–§3.
+
+---
+
+## 4. Subsystem Equations (only changed/new subsections shown in full; unchanged ones referenced back to v0.2)
+
+§4.1 Atmosphere, §4.2 Intake, §4.3 Fuel, §4.4 Ideal Otto Cycle, §4.5 Real-Cycle Correction, §4.7 Propeller/Load, §4.9's CHT/EGT-lag/oil-temp ODEs, §4.10 Oil Pressure, §4.11 Vibration, §4.12 Sensor Model: **all unchanged from v0.2**, still classified REF/DERIVED/ASSUMED/CONFIG as before. Only §4.6 (mechanical dynamics) and §4.8 (energy balance) are revised below.
+
+### 4.6 Mechanical Dynamics & Brake Power — **now with explicit numerical safety**
+
+Power chain into the ODE, unchanged from v0.2:
+```
+P_fuel = ṁ_fuel·LHV → P_otto,ideal = η_otto,ideal·P_fuel → P_ind,real = η_ind,real·P_otto,ideal
+```
+
+**4.6a — Division-by-zero guard (numerical, not physical):**
+```
+ω_floor = 2π·N_floor/60,    N_floor = CONFIG, default 300 RPM      NUMERICAL GUARD ONLY
+ω_div    = max(ω, ω_floor)                                          used only inside the division below
+T_ind    = P_ind,real / ω_div                                        [N·m]   DERIVED, now always finite
+```
+**Why this is defensible, not arbitrary:** near ω→0 (holding throttle fixed), `ṁ_air ∝ N` (§4.2: `ṁ_air = m_air,cycle·n_cyl·N/120`), so `P_ind,real ∝ N ∝ ω` for small ω — the true analytic limit of `P_ind,real/ω` as `ω→0` is a *finite* number (a low-speed "cranking torque"), not infinite. The floating-point `0/0` at exactly `ω=0` is a **numerical artifact of evaluating an indeterminate form**, not evidence the underlying physics blows up. `ω_floor` sits well below idle (idle ω corresponds to ~600–700 RPM in typical CONFIG) specifically so this clamp is inactive during all normal operation and only protects against the literal-zero edge case.
+
+**What this does NOT do:** model how the engine actually gets from stopped to idling (starter motor torque, cranking speed, first-fire dynamics, battery/starter load). **Simulation initialization instead starts the state at `ω(t=0) = ω_idle` directly** — the engine is always initialized "already running at idle." A starter-motor model is explicitly out of scope, per your instruction, and this is the reason no such model is needed for Phase 1: the singular region is simply never visited during normal use, and the guard above exists purely so that adversarial inputs, misconfiguration, or future test harnesses can't crash the integrator.
+
+**4.6b — Negative-ω / stall-floor protection (state clamp, not a stall model):**
+```
+J·dω/dt = T_ind − T_load − T_friction(ω)                            unchanged ODE (REF, rigid-body dynamics)
+```
+If, during a transient, `T_ind < T_load + T_friction`, `dω/dt` is negative — physically valid (the engine is decelerating) as long as `ω` stays positive. To prevent the integrator from ever producing a non-physical negative crankshaft speed:
+```
+ω_candidate = ω_previous + (dt/J)·(T_ind − T_load − T_friction(ω_previous))
+ω_new = max(ω_candidate, ω_floor)                                    NUMERICAL STATE CLAMP
+```
+**Explicitly not a fault/stall model:** this clamp does not stop combustion, does not require a restart event, and does not simulate flameout dynamics (gas-exchange cutoff, ignition loss, recovery behavior). It only prevents the state vector from leaving the physically valid domain (`ω≥0`). **Validation implication (feeds Level 1, §6.1):** none of the six healthy-engine scenarios in §6.1's directional checks should ever *reach* `ω_floor` — if one does during Phase 1 validation, that is a **calibration problem** (e.g., `k_load` or `T_friction0` too large relative to available torque at that operating point), not expected behavior, and must be investigated before proceeding, not silently accepted because the clamp "handled it."
+
+### 4.8 Full Energy Balance / Loss Accounting — **revised split, new parameter surfaced**
+
+Unchanged identity from v0.2 (still exact by construction):
+```
+P_reject,cycle   = (1 − η_otto,ideal)·P_fuel
+P_loss,realcycle = (1 − η_ind,real)·P_otto,ideal
+P_friction       = P_ind,real − P_brake
+  P_fuel ≡ P_brake + P_reject,cycle + P_loss,realcycle + P_friction         EXACT IDENTITY (Level 1 test target)
+```
+
+**What v0.2 got structurally wrong (found while doing §6.2's new plausibility check below):** v0.2 implicitly sent **100%** of `P_reject,cycle` to the exhaust path. That is a hidden, unstated assumption (`k_reject_to_exhaust = 1.0`), and running the numbers (§6.2) shows it produces an implausible split. **v0.3 makes this an explicit parameter instead of leaving it hidden:**
+```
+k_reject_to_exhaust = ASSUMED/CONFIG, default 0.6   (previously implicitly 1.0 in v0.2 — not stated, now corrected)
+
+P_exhaust                = k_reject_to_exhaust·P_reject,cycle + k_split_exhaust·P_loss,realcycle
+P_engine_heat,combustion = (1−k_reject_to_exhaust)·P_reject,cycle + (1−k_split_exhaust)·P_loss,realcycle
+```
+Downstream routing into CHT/oil (§4.9) is otherwise unchanged: `Q_in,CHT = k_cyl_split·P_engine_heat,combustion`; `Q_in,oil = (1−k_cyl_split)·P_engine_heat,combustion + P_friction`.
+
+**Rationale for introducing `k_reject_to_exhaust` rather than just re-tuning `k_split_exhaust`:** the idealized Otto-cycle "heat rejection" step (5→6) is a *reversible, idealized* stand-in for the real blowdown/exhaust process. Physically, some of that heat genuinely leaves via hot exhaust gas, but some is also transferred to the cylinder/head walls during the real (non-instantaneous, non-adiabatic) blowdown before the exhaust valve fully clears the cylinder. Attributing 100% of it to exhaust was the actual source of the implausible split, not `k_split_exhaust` (which only governs the *smaller* `P_loss,realcycle` term) — re-tuning `k_split_exhaust` alone could not have fixed the magnitude problem. This is reported here as a finding, not a cosmetic fix.
+
+---
+
+## 5. FOCA Report — Integration as Real-Engine Benchmark (Level 3 anchor only)
+
+**Source:** Swiss FOCA, *Aircraft Piston Engine Emissions — Summary Report*, Ref. 0/3/33/33-05-003.022, June 2007. Full text read and searched (200 pages, `pdftotext` extraction). Covers three tested aircraft engines: Lycoming O-360 (carbureted), Lycoming IO-360 (fuel-injected), Continental/TCM IO-550B (fuel-injected).
+
+**Explicit boundary (per your instruction):** none of the following FOCA-sourced numbers are used as CONFIG defaults for the generic simulator engine (§ parameter table, unchanged from v0.2 for that reason). They are cited **only** as independent real-world reference points for the Level 3 plausibility comparison in §6.3.
+
+### 5.1 Facts used to refine/cross-check existing REF values
+- **Stoichiometric AFR for AVGAS = 14.6:1**, derived by FOCA directly from the combustion reaction equation `C7H13 + 10.25 O2 + 39 N2 → 7 CO2 + 6.5 H2O + 39 N2` (FOCA §2.2.1b). This is a more precisely *derived* value than the FAA AMTP's rounded "≈15:1," and the two are consistent (within ~3%). **v0.3 keeps `AFR_target=13.0` as CONFIG** (unchanged) but now notes explicitly: `13.0/14.6 = λ≈0.89`, close to FOCA's documented best-power point (λ≈0.85, "100°F rich of peak EGT") — this is a useful cross-check that the existing CONFIG default sits in a physically sensible mixture region, not a claim that 13.0 is "correct."
+- **λ (lambda) definition and typical values**, directly usable as an alternate/future parameterization of mixture: `λ = AFR_actual/14.6`; λ=1 → peak EGT; λ≈0.85 → best power; λ≈0.95 → typical cruise mixture; λ≈1.15 → best economy/leanest practical mixture (FOCA §2.2.2b–d). **Not implemented as a control input in v0.3** (AFR is still held constant, §4.3) — flagged as a natural future extension (mixture-lever input), not added now per your "do not overcomplicate" instruction.
+- **Torque–power relation confirmed independently:** FOCA Appendix 3 §2 derives `P = M·ω = M·2π·n` (n = rev/s) and works a numeric example (2400 RPM, 400 N·m → ≈100 kW). This is the same relation used throughout §4.6/§4.8 (`T=P/ω`); now double-cited (standard mechanical dynamics **and** FOCA App.3) rather than resting on textbook physics alone.
+- **Terminology match:** FOCA Appendix 3 §1 defines **brake horsepower** as power "at the engine's output shaft, as on an engine dynamometer," and distinguishes it from propeller horsepower — matching exactly how `P_brake` is defined in §4.6 (crankshaft-output power, net of internal friction, before any external gearbox/accessory losses, which this simulator doesn't model anyway since it targets a direct-drive light engine).
+
+### 5.2 Standard power-mode definitions (used to structure §6.3's operating-point test)
+FOCA Table 1 (§2.1.1) defines standard ground-test power modes as **% of maximum propeller HP**: Take-off 100%, Climb-out 85%, Cruise 65%, Approach 45%, Taxi per operator's manual. §6.3's four operating points are now explicitly mapped to these standard percentages (Idle≈Taxi, Cruise=65%, Higher-power cruise≈Climb-out=85%, Takeoff-like=100%) rather than the vague "low/moderate/high throttle" language used in v0.1/v0.2.
+
+### 5.3 Real flight/ground-test data ranges (order-of-magnitude sanity check only)
+FOCA Appendix 3 Table 1 gives real logged data for a Lycoming O-360-A3A (compression ratio 8.5:1 — coincidentally the same value independently chosen as this simulator's CONFIG default `r`, which is a useful coincidence to note but **not** a claim that this simulator represents an O-360) across altitudes 2000–6000 ft and power settings idle→full-throttle:
+
+| Quantity | FOCA-logged range (O-360-A3A) |
+|---|---|
+| RPM | 1410–2570 |
+| MAP | 10–28 inHg |
+| CHT ("T Zyl") | 170–220 °C |
+| Oil temperature | 75–98 °C |
+| Fuel flow | 8–59 L/h |
+
+These are used in §6.3 **only** as an order-of-magnitude plausibility band — if the simulator's generic-engine outputs land wildly outside this range at comparable power settings, that's worth investigating; landing inside it is a mild positive sign, not proof of correctness, because the simulator is a different (generic) engine by design.
+
+### 5.4 Documented behavior explicitly NOT modeled (flagged, not silently ignored)
+FOCA §2.2.2e (Figure 5) documents how CHT, EGT, and power all vary as the mixture (λ) is swept at fixed throttle — e.g., CHT peaks *between* best-power and peak-EGT mixture, then falls significantly on the lean side. **This simulator has no such coupling** (AFR/λ is held constant, §4.3) — CHT/EGT here only respond to RPM/load, never to mixture setting. Added explicitly to §9's limitations list; a legitimate, well-documented candidate for a future extension, not attempted in Phase 1.
+
+---
+
+## 6. Validation Plan — Three Explicit Levels (Deliverable E)
+
+### 6.1 Level 1 — Mathematical / Physical Consistency
+- [ ] Dimensional consistency audit (carried over from v0.2 §8, unchanged, still passes)
+- [ ] **No divide-by-zero / NaN / Inf** at ω=0 or any input combination (§4.6a's `ω_div` guard exercised explicitly with a `throttle>0, ω=0` unit case)
+- [ ] **No negative ω** under any of the six §6.4-scenario transients (§4.6b's clamp exercised; **clamp must not actually trigger** during any healthy-engine scenario — if it does, that's a fail requiring recalibration, not a pass)
+- [ ] **Energy Bookkeeping / Implementation-Integrity Test** (renamed from v0.2's "energy conservation test," per your correction): `|P_fuel − (P_brake+P_reject,cycle+P_loss,realcycle+P_friction)| / P_fuel < 1×10⁻³` at `dt=0.1s`, tightening as `dt`↓. **Explicitly verifies code correctness (arithmetic self-consistency of the implemented chain), not physical validity** — a badly-calibrated model with wrong `η_ind,real` or `k_reject_to_exhaust` still passes this perfectly, because every term is a difference between adjacent stages of the same chain by construction.
+- [ ] Timestep convergence (`dt=0.10/0.05/0.01s`, unchanged from v0.2)
+
+### 6.2 Level 1.5 — Thermal-Source Plausibility Test (**new, distinct from bookkeeping**)
+At each of §6.3's four steady-state operating points, compute and report:
+```
+%brake, %exhaust, %CHT, %oil          (four categories, sum to exactly 100% — Level 1 concern)
+```
+**worked example at the "Cruise" point using current CONFIG defaults** (`r=8.5, γ=1.3 → η_otto,ideal≈0.47`; `η_ind,real=0.70`; `target_mech_eff≈0.88`; `k_reject_to_exhaust=0.6`; `k_split_exhaust=0.5`; `k_cyl_split=0.7`):
+```
+%brake   ≈ 29.0%
+%exhaust ≈ 38.9%
+%CHT     ≈ 19.8%
+%oil     ≈ 12.4%          (sum ≈ 100.1%, rounding)
+```
+**Plausibility judgment (not hard pass/fail, since the split parameters are ASSUMED):** exhaust as the single largest category and brake landing near FAA Ch.6's/FOCA's general "~a quarter to ~a third of fuel energy becomes useful work" statements are both directionally reasonable for a real SI engine. **Soft criteria to check once implemented:** no category negative or >100% (hard fail, implementation bug); `%exhaust` should be the largest or tied-largest category (general SI-engine knowledge — if brake or CHT come out largest instead, investigate); `%brake` roughly 20–35% (order-of-magnitude check against FAA/FOCA figures, not an exact target).
+
+### 6.3 Level 2 — Directional / Behavioral Validation
+Unchanged scenario set from v0.2 (throttle step, altitude sweep, ambient-temp sweep, load sweep, sustained high power, recovery) **plus the twelve directional inequality checks from v0.2 §9.5, all still required.** Steady-state operating-point table **now explicitly tied to FOCA's standard percentages (§5.2):**
+
+| Operating point | % max propeller power (per FOCA Table 1) | Record |
+|---|---|---|
+| Idle/Taxi | per operator's manual (low, e.g. ~10–15%, CONFIG) | RPM, torque, `P_brake`, `ṁ_fuel`, `ṁ_air`, CHT, EGT, oil_temp, oil_pressure, vibration, §6.2's four %-split values |
+| Cruise | 65% | same |
+| Higher-power cruise (Climb-out analogue) | 85% | same |
+| Takeoff-like | 100% | same |
+
+### 6.4 Level 3 — Representative Real-Engine Comparison (FOCA-anchored, explicitly bounded)
+Compare Level-2 outputs, **as broad trends only**, against:
+- FOCA's λ/mixture behavior (§5.1) — not directly testable in v0.3 since mixture isn't a control input yet; noted as future validation once mixture control is implemented.
+- FOCA's standard power-mode %s (§5.2) — structural comparison only (does our simulator produce a sensible fuel-flow ordering: Taxi < Approach < Cruise < Climb < Takeoff?).
+- FOCA's logged O-360 ranges (§5.3) — order-of-magnitude sanity band for RPM/CHT/oil-temp/fuel-flow at comparable power settings.
+
+**Explicit statement, as required:** *Level 3 cannot prove that this simulator represents a real UAV engine, or any specific real engine at all. The simulator is intentionally generic and reduced-order; landing within FOCA's O-360 ranges is a mild plausibility signal, not validation of correctness, and a large deviation would need investigation but would not by itself prove the model wrong, since it isn't attempting to reproduce that specific engine.*
+
+---
+
+## 7. Model-Validity / Confidence Table (Deliverable F)
+
+| Quantity | Model source | Validation possible? | Expected confidence |
+|---|---|---|---|
+| Atmospheric ρ, p | ISA closed-form (REF) | Yes — exact, checkable against published ISA tables | **High** |
+| Air mass flow | ASSUMED η_v(N) curve × ISA ρ | Partial — altitude/RPM trend checkable; absolute value uncalibrated | Medium (trend) / Low (absolute) |
+| Fuel flow | `ṁ_air × f`, `AFR_target` CONFIG | Partial — FOCA gives real order-of-magnitude ranges (§5.3, Level 3) | Medium |
+| Ideal-cycle efficiency `η_otto,ideal` | Closed-form, DERIVED from NASA GRC relations | Yes — exact given `r,γ` | High (conditional on `r,γ`, which are themselves CONFIG/ASSUMED) |
+| Real indicated power `P_ind,real` | `η_ind,real` ASSUMED scalar | No direct validation without dynamometer/IMEP data | **Low** |
+| Brake power / torque | Derived from ODE + friction model; `P=Mω` REF (FOCA App.3, standard dynamics) | Partial — the relation itself is exact; friction coefficients are calibrated, not measured | Medium |
+| RPM dynamic response | Standard rigid-body ODE | Structurally yes (ODE form is exact); time constants (`J`, friction) are CONFIG | Medium |
+| CHT | Lumped ODE, ASSUMED heat routing (§4.8, now revised) | Trend only (Level 2); absolute value/timing uncalibrated to any real engine | Low–Medium |
+| EGT (proxy) | `T5` (Otto cycle) + ASSUMED lag | Explicitly a proxy — real EGT's blowdown/gas-dynamics/location effects unmodeled | **Low** |
+| Oil temperature | Lumped ODE, ASSUMED split + friction routing | Trend only | Low–Medium |
+| Oil pressure | ASSUMED functional form, REF-bounded cap (35–90 psi) | Qualitative trend only (∝N, ∝1/viscosity); functional form itself unvalidated | **Low** |
+| Vibration | ASSUMED RMS proxy | Trend only (↑ with RPM/load); not a resolved signal | **Low** |
+
+---
+
+## 8. Updated Energy-Flow Diagram (Deliverable C)
+
+```
+                              P_fuel = ṁ_fuel · LHV
+                                      │
+                          η_otto,ideal = 1−1/r^(γ−1)   (DERIVED, NASA GRC)
+                          ┌───────────┴────────────┐
+                          ▼                         ▼
+                    P_otto,ideal          P_reject,cycle = (1−η_otto,ideal)·P_fuel
+                          │                         │
+                  η_ind,real (ASSUMED)     split by k_reject_to_exhaust (NEW, ASSUMED — was hidden at 1.0 in v0.2)
+                  ┌───────┴────────┐               ┌──────┴──────┐
+                  ▼                ▼                ▼             ▼
+            P_ind,real   P_loss,realcycle    →exhaust         →engine_heat,A
+                  │        split by k_split_exhaust┘               │
+     ┌────────────┴─────────────┐        │                        │
+     ▼                          │        ▼                        ▼
+§4.6a/b: ω_div guard,           │   P_exhaust ◄───────────┐   P_engine_heat,combustion
+ω_floor clamp on ODE state       │   (bookkeeping only;     │   (splits by k_cyl_split)
+     │                          │    EGT still driven by   │        │           │
+J·dω/dt=T_ind−T_load−T_fric     │    T5 in temperature      │        ▼           ▼
+     │                          │    domain, §4.9)          │   Q_in,CHT    Q_in,oil(+P_friction)
+┌────┴────┐                     │                           │        │           │
+▼         ▼                     └───────────────────────────┘        ▼           ▼
+P_friction  P_brake = P_ind,real−P_friction                       CHT ODE    oil_temp ODE
+(→oil)       │
+        ┌────┴────┐
+        ▼         ▼
+    P_load   P_kinetic_storage (J·ω·dω/dt, transients only, vanishes at steady state)
+
+  ALL FOUR TOP-LEVEL TERMS SUM EXACTLY:  P_brake + P_reject,cycle + P_loss,realcycle + P_friction ≡ P_fuel
+  Worked split at Cruise (§6.2 defaults): brake 29.0% / exhaust 38.9% / CHT 19.8% / oil 12.4%
+```
+
+## 9. Updated Subsystem Dependency Diagram (Deliverable D)
+
+```
+throttle, alt, T_amb ──► atmosphere.py ──► ρ, p, T_intake
+                                │
+throttle, N, ρ ──► intake.py ──► ṁ_air ──► fuel.py ──► ṁ_fuel, f
+                                                  │
+                                     combustion.py (Otto cycle §4.4 + real-cycle §4.5)
+                                     → T3,T4,T5, P_fuel, P_otto,ideal, P_ind,real
+                                                  │
+                          ┌───────────────────────┼─────────────────────────┐
+                          ▼                       ▼                         ▼
+                mechanical.py (§4.6a/b:      energy_balance.py         (T5 → EGT lag)
+             ω_floor guard + clamp)          (§4.8: k_reject_to_exhaust,
+                          │                   k_split_exhaust routing)
+                 ┌────────┼─────────┐                  │
+                 ▼        ▼         ▼                  ▼
+          propeller.py  lubrication.py         thermal.py (CHT, oil_temp ODEs)
+                 │        (§4.10, N,T_oil)              │
+                 └────────┴──────────────────────────────┘
+                                          │
+                              vibration.py (N, load)
+                                          │
+                              ALL true states ──► sensor_model.py ──► telemetry
+```
+
+---
+
+## 10. Remaining Engineering Assumptions (Deliverable G)
+
+All items carried over from v0.2 §10, **plus**:
+- `k_reject_to_exhaust=0.6` (new) — no fetched reference splits idealized-cycle heat rejection between exhaust and in-cylinder heat transfer this precisely; chosen to produce a plausible three-way split (§6.2), not derived from data.
+- `ω_floor`/`N_floor=300 RPM` — purely numerical, chosen to sit safely below idle, not a physical parameter.
+- Idle initialization (`ω(t=0)=ω_idle`) as the substitute for starter-motor modeling — an explicit scoping choice, not an oversight.
+
+## 11. Known Limitations (Deliverable H)
+
+All items carried over from v0.2 §11, **plus**:
+- No mixture (λ)-to-CHT/EGT/power coupling, despite this being well-documented in FOCA (§5.4) — flagged, deferred.
+- `k_reject_to_exhaust` is a genuinely uncertain split; §6.2's worked numbers should be revisited once real dynamometer or FOCA-style in-flight data for *any* comparable engine's Sankey-style energy balance is available (FOCA's report is emissions-focused, not a full engine energy-balance study, so it doesn't directly supply this number either).
+- Numerical floor (`ω_floor`) means the simulator cannot represent an actual engine stall/flameout — it will simply hold at the floor rather than modeling the real physics of combustion cessation, which is correctly out of scope but worth remembering when interpreting any edge-case test result.
+
+## 12. Exact List of Parameters Needing Calibration During Implementation (Deliverable I)
+
+| Parameter | Current placeholder | Why it needs calibration |
+|---|---|---|
+| `η_ind,real` | 0.70 | Chosen to land in a plausible indicated-efficiency band, not fitted |
+| `target_mech_eff_at_rated` (→ `T_friction0`,`c_friction`) | 0.88 | Same — calibration target, not measured |
+| `k_reject_to_exhaust` | 0.6 | **Newly surfaced this round**; directly controls exhaust-vs-engine-heat balance |
+| `k_split_exhaust` | 0.5 | No basis to favor either side |
+| `k_cyl_split` | 0.7 | Affects CHT-vs-oil heat balance |
+| `γ` | 1.3 | Combustion-gas approximation, affects `η_otto,ideal` directly |
+| `η_v,max`, `k_v`, `N_ref` | 0.85 / 0.3 / 2400 RPM | VE curve shape, affects air/fuel/power scaling with RPM |
+| `C_CHT`, `C_oil` | CONFIG (unset) | Directly set thermal time constants — critical for §6.3's lag/recovery checks |
+| `h_cool(N)`, `A_fin`, `h_oilcool`, `A_oilcooler` | CONFIG (unset) | Set steady-state temperature *levels*, not just trend |
+| `τ_EGT` | 1.5 s | Representative only |
+| `k_pump`, `μ_ref`, `b`, `T_ref`, `P_oil,max` | CONFIG (unset) / ≈413 kPa | Oil-pressure absolute level and RPM-sensitivity |
+| `k_v1`, `k_v2` | CONFIG (unset) | Vibration proxy scaling |
+| `k_load` | CONFIG (unset) | Sets how hard the propeller loads the engine at a given RPM — directly affects whether `ω_floor` is ever approached (§4.6b) |
+| `N_floor` (`ω_floor`) | 300 RPM | Numerical only, but must stay below idle with margin |
+
+---
+
+## 13. References
+Unchanged core list from v0.2 §13, **plus**:
+10. Swiss FOCA, *Aircraft Piston Engine Emissions — Summary Report*, Ref. 0/3/33/33-05-003.022, June 2007 (200 pp.) — Level 3 real-engine benchmark only (§5); stoichiometric AFR (14.6:1), λ definitions/typical values, standard power-mode percentages (Table 1), torque-power relation (Appendix 3 §2), and Lycoming O-360-A3A logged flight-test data (Appendix 3 Table 1) cited specifically. **Not used to set any CONFIG default.**
+
+---
+*Phase 1 (healthy engine) only. No code yet. Awaiting your review before implementation.*
