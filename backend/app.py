@@ -36,7 +36,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",  # Vite dev server
         "http://localhost:3000",  # Alternative React dev
-        "https://*.vercel.app",   # Vercel deployments
+        "https://digital-twin-sim-beige.vercel.app/",   # Vercel deployments
         "*"  # For demo - restrict in production
     ],
     allow_credentials=True,
